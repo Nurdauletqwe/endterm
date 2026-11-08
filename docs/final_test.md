@@ -19,7 +19,7 @@ The student interface did not change after Stage 2, so the first three results w
 7 of 7 screens, including the new Cancel button — met.
 
 ## Criterion 3: staff status change visible within 5 s
-(to be added)
+1–3 s, mean 2.1 s (5 runs) — met.
 
 ## Performance (R10)
 Chrome DevTools, Fast 4G, cache off, https://docrequest-bogp.onrender.com/new
