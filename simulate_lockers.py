@@ -18,7 +18,6 @@ def send(locker_id, event_type, request_id=None, battery=None):
 
 
 def read_world():
-    """lockers, occupancy (locker -> request id or None) and Ready requests that are not placed yet"""
     con = psycopg2.connect(DB_URL, cursor_factory=psycopg2.extras.RealDictCursor)
     try:
         with con.cursor() as cur:
@@ -37,7 +36,6 @@ def read_world():
 
 
 def plan(rnd, occupied, to_place):
-    """decide at most one action in this tick: ('place'|'collect', locker_id, request_id) or None"""
     free = [r for r in to_place if r["locker_id"] not in occupied]
     if free and rnd.random() < 0.5:
         r = rnd.choice(free); return ("place", r["locker_id"], r["request_id"])

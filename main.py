@@ -1,18 +1,24 @@
-import os, html, hmac
+import os, html, hmac, time
+import mailer
 from contextlib import contextmanager
 from functools import wraps
 import psycopg2, psycopg2.extras
 from flask import (Flask, request, redirect, session, url_for, render_template_string,
                    flash, abort, jsonify)
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)       
 app.secret_key = os.environ.get("SECRET_KEY", "dev-only-change-me")
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
+                  SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE") == "1")   
 DB_URL = os.environ.get("DATABASE_URL", "dbname=docrequest user=postgres password=12345 host=localhost")
 STATUSES = ["New", "In progress", "Ready", "Cancelled"]
 STATUS_ICONS = {"New": "i-send", "In progress": "i-pending", "Ready": "i-check", "Cancelled": "i-cancel"}
 EMAIL_DOMAIN = "@astanait.edu.kz"
 app.jinja_env.globals["STATUS_ICONS"] = STATUS_ICONS
 
+PAGE_SIZE = 20                                                  
 PICKUP_SQL = "CASE WHEN p.point_id IS NULL THEN NULL ELSE p.block || ', room ' || p.room END"
 
 
@@ -33,7 +39,7 @@ def login_required(role):
             if "uid" not in session:
                 return redirect(url_for("login"))
             if session["role"] != role:
-                abort(403)
+                abort(403)                      
             return f(*a, **k)
         return wrap
     return deco
@@ -47,8 +53,11 @@ MACROS = """
 {% macro badge(s, before=False) -%}
 <span class="status status-{{ s|lower|replace(' ', '-') }}">{{ icon(STATUS_ICONS[s], before) }} {{ s }}</span>
 {%- endmacro %}
+{% macro cancel_btn(r) -%}
+{%- if r.status == 'New' -%}<form method="post" action="{{ url_for('cancel_request', rid=r.request_id) }}" class="cancel-form"><button class="btn btn-sm btn-outline-danger">Cancel</button></form>{%- endif -%}
+{%- endmacro %}
 {% macro req_row(r, before=False, fresh=False) -%}
-<tr data-id="{{ r.request_id }}" data-status="{{ r.status }}"{% if fresh %} class="row-new"{% endif %}><td>{{ r.request_id }}</td><td>{{ r.name }}</td><td>{{ r.copies }}</td><td class="st">{{ badge(r.status, before) }}</td><td class="pk">{% if r.pickup %}{{ r.pickup }}{% else %}&mdash;{% endif %}</td><td>{{ r.created_at }}</td></tr>
+<tr data-id="{{ r.request_id }}" data-status="{{ r.status }}"{% if fresh %} class="row-new"{% endif %}><td>{{ r.request_id }}</td><td>{{ r.name }}</td><td>{{ r.copies }}</td><td class="st">{{ badge(r.status, before) }}</td><td class="pk">{% if r.pickup %}{{ r.pickup }}{% else %}&mdash;{% endif %}</td><td>{{ r.created_at }}</td><td class="act">{{ cancel_btn(r) }}</td></tr>
 {%- endmacro %}
 """
 
@@ -74,6 +83,8 @@ BASE = MACROS + """<!doctype html>
             padding:.75rem 1rem;border-radius:.5rem;background:#d1e7dd;color:#0a3622;border:1px solid #a3cfbb;animation:slide-in .35s ease-out}
  .toast-box.toast-error{background:#f8d7da;color:#58151c;border-color:#f1aeb5}
  .row-new td{animation:flash 2.4s ease-out}
+ .sound-switch{display:flex;align-items:center;gap:.75rem;min-height:44px;cursor:pointer}
+ .sound-switch input{width:1.5rem;height:1.5rem;flex:none}
  .bar{height:1.1rem;background:#0d6efd;border-radius:.25rem}
  @keyframes slide-in{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}
  @keyframes flash{from{background:#cfe2ff}to{background:transparent}}
@@ -106,7 +117,7 @@ BASE = MACROS + """<!doctype html>
 
 def page(body, **ctx):
     before = request.args.get("media") == "before"                  
-    poll = request.args.get("poll") != "off" and not before          
+    poll = request.args.get("poll") != "off" and not before         
     return render_template_string(BASE.replace("{% block body %}{% endblock %}", body), before=before, poll=poll, **ctx)
 
 
@@ -230,12 +241,12 @@ def new_request():
                            VALUES (%s, %s, %s, %s) RETURNING request_id, status, created_at""",
                         (session["uid"], type_id, purpose, copies))
             new = cur.fetchone()
-            if wants_json():
+            if wants_json():          
                 row = dict(request_id=new["request_id"], name=doc["name"], copies=copies, status=new["status"],
                            pickup=None, created_at=new["created_at"].strftime("%Y-%m-%d %H:%M:%S"))
                 row_html = render_template_string(MACROS + "{{ req_row(r, False, True) }}", r=row)
                 return jsonify(request_id=row["request_id"], status=row["status"], row_html=row_html)
-            flash(f"Request #{new['request_id']} submitted. Status: {new['status']}")
+            flash(f"Request #{new['request_id']} submitted. Status: {new['status']}")   
             return redirect(url_for("new_request"))
         cur.execute("SELECT type_id, name FROM document_types ORDER BY name")
         types = cur.fetchall()
@@ -268,15 +279,13 @@ def new_request():
      <input id="copies" name="copies" type="number" min="1" max="10" value="1" class="form-control mb-3">
      <button type="submit" class="btn btn-primary w-100" style="height:48px">Submit</button>
     </form>
-    <div class="form-check mb-4">
-     <input class="form-check-input" type="checkbox" id="soundOn" checked>
-     <label class="form-check-label" for="soundOn">Play a short sound when a request is sent or becomes ready</label></div>
+    <label class="sound-switch mb-4" for="soundOn"><input type="checkbox" id="soundOn" checked> <span>Play a short sound when a request is sent or becomes ready</span></label>
     <audio id="notifySound" src="{{ url_for('static', filename='notification.mp3') }}" preload="none"></audio>
 
     <h2 class="h5">My requests</h2>
     <div class="table-responsive"><table class="table">
      <caption class="visually-hidden">My document requests, their status and where to pick them up</caption>
-     <thead><tr><th scope="col">#</th><th scope="col">Document</th><th scope="col">Copies</th><th scope="col">Status</th><th scope="col">Pick up at</th><th scope="col">Date</th></tr></thead>
+     <thead><tr><th scope="col">#</th><th scope="col">Document</th><th scope="col">Copies</th><th scope="col">Status</th><th scope="col">Pick up at</th><th scope="col">Date</th><th scope="col">Action</th></tr></thead>
      <tbody id="myRows">{% for r in mine %}{{ req_row(r, before) }}{% endfor %}</tbody></table></div>
 
     <script>
@@ -303,6 +312,21 @@ def new_request():
           .then(function () { btn.disabled = false; });
       });
 
+      rows.addEventListener('submit', function (e) {
+        var f = e.target; if (!f.classList.contains('cancel-form')) { return; }
+        e.preventDefault();
+        var tr = f.closest('tr'), id = tr.dataset.id;
+        if (!window.confirm('Cancel request #' + id + '?')) { return; }
+        fetch(f.action, { method: 'POST', headers: { 'Accept': 'application/json' } })
+          .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+          .then(function (x) {
+            if (!x.ok) { throw new Error(x.d.error || 'Server error'); }
+            tr.dataset.status = x.d.status; tr.querySelector('.st').innerHTML = x.d.badge; tr.querySelector('.act').textContent = '';
+            show('Request #' + id + ' is cancelled', false);
+          })
+          .catch(function (err) { show('Could not cancel: ' + err.message, true); });
+      });
+
       {% if poll %}
       function refresh() {
         fetch('{{ url_for("api_my_requests") }}', { headers: { 'Accept': 'application/json' }, cache: 'no-store' })
@@ -313,6 +337,7 @@ def new_request():
               var pk = tr.querySelector('.pk'), place = it.pickup || '\\u2014';
               if (tr.dataset.status !== it.status) {
                 tr.dataset.status = it.status; tr.querySelector('.st').innerHTML = it.badge; pk.textContent = place;
+                if (it.status !== 'New') { tr.querySelector('.act').textContent = ''; }
                 if (it.status === 'Ready') { show('\\u2714 Request #' + it.id + ' is ready. Pick it up at ' + place, false); play(); }
                 else { show('Request #' + it.id + ' is now: ' + it.status, false); }
               } else if (pk.textContent !== place) { pk.textContent = place; show('Request #' + it.id + ': pick up at ' + place, false); }
@@ -323,6 +348,30 @@ def new_request():
       {% endif %}
     })();
     </script>""", types=types, mine=mine)
+
+
+@app.route("/new/cancel/<int:rid>", methods=["POST"])
+@login_required("student")
+def cancel_request(rid):
+    with db() as cur:
+        cur.execute("""UPDATE requests SET status = 'Cancelled', updated_at = now()
+                       WHERE request_id = %s AND student_id = %s AND status = 'New' RETURNING request_id""",
+                    (rid, session["uid"]))
+        done = cur.fetchone()
+        if done:
+            cur.execute("""INSERT INTO status_history (request_id, old_status, new_status, changed_by)
+                           VALUES (%s, 'New', 'Cancelled', %s)""", (rid, session["uid"]))
+    if not done:
+        message = "Only your own requests with status New can be cancelled"
+        if wants_json():
+            return jsonify(error=message), 409
+        flash(message)
+        return redirect(url_for("new_request"))
+    if wants_json():
+        return jsonify(request_id=rid, status="Cancelled",
+                       badge=render_template_string(MACROS + "{{ badge(s, False) }}", s="Cancelled"))
+    flash(f"Request #{rid} cancelled")
+    return redirect(url_for("new_request"))
 
 
 @app.route("/api/my-requests")
@@ -339,24 +388,36 @@ def api_my_requests():
 @login_required("staff")
 def staff_list():
     status, tid = request.args.get("status", ""), request.args.get("type_id", "")
+    try:
+        pg = max(1, int(request.args.get("page", "1")))
+    except ValueError:
+        pg = 1
     sql = ("""SELECT r.request_id, u.full_name, d.name AS doc, r.created_at, r.status, r.pickup_point_id, """ + PICKUP_SQL + """ AS pickup
               FROM requests r JOIN users u ON u.user_id = r.student_id
               JOIN document_types d ON d.type_id = r.type_id
               LEFT JOIN pickup_points p ON p.point_id = r.pickup_point_id WHERE 1=1""")
     params = []
-    if status:
+    if status == "all":
+        pass            
+    elif status in STATUSES:
         sql += " AND r.status = %s"; params.append(status)
+    else:
+        sql += " AND r.status IN ('New', 'In progress')" 
     if tid.isdigit():
         sql += " AND r.type_id = %s"; params.append(int(tid))
-    sql += " ORDER BY r.created_at DESC LIMIT 100"
+    sql += " ORDER BY r.created_at DESC LIMIT %s OFFSET %s"
+    params += [PAGE_SIZE + 1, (pg - 1) * PAGE_SIZE]        
     with db() as cur:
         cur.execute(sql, params); rows = cur.fetchall()
         cur.execute("SELECT type_id, name FROM document_types ORDER BY name"); types = cur.fetchall()
         cur.execute("SELECT point_id, block, room FROM pickup_points ORDER BY block, room"); points = cur.fetchall()
+    has_next = len(rows) > PAGE_SIZE
+    rows = rows[:PAGE_SIZE]
     return page("""<h1 class="h4">Requests</h1>
     <form class="row g-2 mb-3">
      <div class="col-auto"><label class="visually-hidden" for="f_status">Filter by status</label>
-      <select id="f_status" name="status" class="form-select"><option value="">Status: All</option>
+      <select id="f_status" name="status" class="form-select"><option value="">Open requests (New + In progress)</option>
+       <option value="all" {{ 'selected' if status == 'all' }}>All statuses</option>
        {% for s in sts %}<option {{ 'selected' if s == status }}>{{ s }}</option>{% endfor %}</select></div>
      <div class="col-auto"><label class="visually-hidden" for="f_type">Filter by document type</label>
       <select id="f_type" name="type_id" class="form-select"><option value="">Type: All</option>
@@ -368,14 +429,27 @@ def staff_list():
      <thead><tr><th scope="col">Student</th><th scope="col">Document</th><th scope="col">Date</th><th scope="col">Status</th><th scope="col">Pick up at</th><th scope="col">Change status and pickup point</th></tr></thead>
      <tbody>{% for r in rows %}<tr><td>{{ r.full_name }}</td><td>{{ r.doc }}</td><td>{{ r.created_at }}</td><td>{{ badge(r.status, before) }}</td>
       <td>{% if r.pickup %}{{ r.pickup }}{% else %}&mdash;{% endif %}</td><td>
-      <form method="post" action="{{ url_for('set_status', rid=r.request_id) }}" class="d-flex gap-1 flex-wrap">
+      <form method="post" action="{{ url_for('set_status', rid=r.request_id) }}" class="status-form d-flex gap-1 flex-wrap">
        <select name="status" class="form-select form-select-sm w-auto" aria-label="New status for request {{ r.request_id }}">
         {% for s in sts %}<option {{ 'selected' if s == r.status }}>{{ s }}</option>{% endfor %}</select>
        <select name="pickup_point_id" class="form-select form-select-sm w-auto" aria-label="Pickup block and room for request {{ r.request_id }}">
         <option value="">Pickup point (needed for Ready)</option>
         {% for p in points %}<option value="{{ p.point_id }}" {{ 'selected' if r.pickup_point_id == p.point_id }}>{{ p.block }} &middot; room {{ p.room }}</option>{% endfor %}</select>
-       <button class="btn btn-sm btn-primary">Save</button></form></td></tr>{% endfor %}</tbody></table></div>""",
-                rows=rows, types=types, points=points, sts=STATUSES, status=status, tid=tid)
+       <button class="btn btn-sm btn-primary">Save</button></form></td></tr>{% endfor %}</tbody></table></div>
+    <nav aria-label="Pages" class="d-flex gap-3 align-items-center mb-3">
+     {% if pg > 1 %}<a href="{{ url_for('staff_list', status=status, type_id=tid, page=pg-1) }}">&laquo; Previous 20</a>{% endif %}
+     <span>Page {{ pg }}</span>
+     {% if has_next %}<a href="{{ url_for('staff_list', status=status, type_id=tid, page=pg+1) }}">Next 20 &raquo;</a>{% endif %}</nav>
+    <script>
+    (function () {
+      function check(f) {
+        var bad = f.elements['status'].value === 'Ready' && !f.elements['pickup_point_id'].value;
+        f.querySelector('button').disabled = bad; f.elements['pickup_point_id'].classList.toggle('is-invalid', bad);
+      }
+      document.querySelectorAll('form.status-form').forEach(function (f) { check(f); f.addEventListener('change', function () { check(f); }); });
+    })();
+    </script>""",
+                rows=rows, types=types, points=points, sts=STATUSES, status=status, tid=tid, pg=pg, has_next=has_next)
 
 
 @app.route("/staff/status/<int:rid>", methods=["POST"])
@@ -385,12 +459,13 @@ def set_status(rid):
     point = request.form.get("pickup_point_id", "")
     if new not in STATUSES:
         abort(400)
+    notify = None
     with db() as cur:
         cur.execute("SELECT status, pickup_point_id FROM requests WHERE request_id = %s FOR UPDATE", (rid,))
         row = cur.fetchone()
         if not row:
             abort(404)
-        point_id = None                                   
+        point_id = None                                
         if new == "Ready":
             if not point.isdigit():
                 flash("Choose a pickup point (block and room) before setting Ready")
@@ -405,6 +480,16 @@ def set_status(rid):
         if row["status"] != new:
             cur.execute("""INSERT INTO status_history (request_id, old_status, new_status, changed_by)
                            VALUES (%s, %s, %s, %s)""", (rid, row["status"], new, session["uid"]))
+        if new == "Ready" and (row["status"] != "Ready" or row["pickup_point_id"] != point_id):
+            cur.execute("""SELECT u.email, u.full_name, d.name AS doc, p.block, p.room
+                           FROM requests r JOIN users u ON u.user_id = r.student_id
+                           JOIN document_types d ON d.type_id = r.type_id
+                           JOIN pickup_points p ON p.point_id = %s WHERE r.request_id = %s""", (point_id, rid))
+            notify = cur.fetchone()
+    if notify:                                            
+        mailer.send_async(notify["email"], f"Your document is ready: {notify['doc']}",
+                          f"Hello, {notify['full_name']}!\n\nYour request #{rid} ({notify['doc']}) is ready.\n"
+                          f"Pick it up at block {notify['block']}, room {notify['room']}.\nPlease take your student ID.\n\nDocRequest")
     flash(f"Request #{rid}: status set to {new}")
     return redirect(request.referrer or url_for("staff_list"))
 
@@ -478,7 +563,9 @@ def staff_stats():
 
 
 IOT_EVENTS = ("heartbeat", "door_closed", "door_opened", "document_present", "document_removed")
-DEVICE_TOKEN = os.environ.get("DEVICE_TOKEN", "dev-device-token")       
+HEARTBEAT_DAYS = 90                                                      
+_purge = {"last": 0.0}
+DEVICE_TOKEN = os.environ.get("DEVICE_TOKEN", "dev-device-token")      
 
 LOCKERS_SQL = """SELECT l.locker_id, l.label, p.block, p.room, s.event_type AS state, s.request_id,
                         seen.last_seen, (seen.last_seen > now() - interval '15 seconds') AS online, b.battery_pct
@@ -506,6 +593,14 @@ def locker_snapshot(cur):
                       request=l["request_id"] if l["state"] == "document_present" else None,
                       battery=l["battery_pct"], online=bool(l["online"]), last_seen=fmt(l["last_seen"])) for l in lockers],
         events=[dict(time=fmt(e["created_at"]), label=e["label"], event=e["event_type"].replace("_", " "), request=e["request_id"]) for e in events])
+
+
+def purge_old_heartbeats(cur):
+    if time.time() - _purge["last"] < 3600:
+        return
+    _purge["last"] = time.time()
+    cur.execute("DELETE FROM locker_events WHERE event_type = 'heartbeat' AND created_at < now() - %s * interval '1 day'",
+                (HEARTBEAT_DAYS,))
 
 
 @app.route("/api/lockers")
@@ -579,7 +674,9 @@ def iot_event():
                 return jsonify(error="unknown request"), 404
         cur.execute("""INSERT INTO locker_events (locker_id, request_id, event_type, battery_pct)
                        VALUES (%s, %s, %s, %s) RETURNING event_id""", (locker_id, req, event, battery))
-        return jsonify(event_id=cur.fetchone()["event_id"]), 201
+        event_id = cur.fetchone()["event_id"]
+        purge_old_heartbeats(cur)
+        return jsonify(event_id=event_id), 201
 
 
 if __name__ == "__main__":

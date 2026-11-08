@@ -48,7 +48,7 @@ W, H = 336, 80
 im = Image.new("RGBA", (W*SS//4, H*SS//4), (0, 0, 0, 0)); sc = SS/4
 d = ImageDraw.Draw(im)
 d.rounded_rectangle([4*sc, 4*sc, 76*sc, 76*sc], radius=18*sc, fill=NAVY + (255,))
-draw_icon(ICONS["i-doc"], 1, (255,255,255,255))  
+draw_icon(ICONS["i-doc"], 1, (255,255,255,255))  # no-op guard
 k = 2.2 * sc
 for pts in ICONS["i-doc"]["lines"]:
     P = [(14*sc + x*k, 14*sc + y*k) for x, y in pts]
