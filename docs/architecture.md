@@ -1,6 +1,6 @@
 # As-built architecture — DocRequest
 
-![Architecture](../architecture.png)
+![Architecture](architecture.png)
 
 - Client: browser on a phone or PC (HTML, Bootstrap, JavaScript); the student page asks the server for new statuses every 3 seconds.
 - Network: internet, all traffic over HTTPS (TLS).
